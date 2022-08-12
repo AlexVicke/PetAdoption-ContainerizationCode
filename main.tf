@@ -368,8 +368,8 @@ resource "aws_instance" "PACPJP-Ansiblehost-RAFV" {
   instance_type = var.instance_type
   key_name      = aws_key_pair.PetAdoption1_key.key_name
   #iam_instance_profile  = aws_iam_instance_profile.ansible_host_instance_profile.id
-  subnet_id              = aws_subnet.PACPJP-PubSbnt1-RAFV.id
-  vpc_security_group_ids = [aws_security_group.PACPJP-FE_SGp-RAFV.id]
+  subnet_id                   = aws_subnet.PACPJP-PubSbnt1-RAFV.id
+  vpc_security_group_ids      = [aws_security_group.PACPJP-FE_SGp-RAFV.id]
   associate_public_ip_address = true
 
   user_data = <<-EOF
@@ -533,4 +533,204 @@ data "aws_instance" "PACPJP-Ansiblehost-RAFV" {
   depends_on = [
     aws_instance.PACPJP-Ansiblehost-RAFV
   ]
+}
+
+
+#PROVISION SUBNET_GROUP FOR RDS
+resource "aws_db_subnet_group" "PACPJP-SbntGp-RAFV" {
+  name       = "pacpjp-sbntgp-rafv"
+  subnet_ids = [aws_subnet.PACPJP-PrvSbnt1-RAFV.id, aws_subnet.PACPJP-PrvSbnt2-RAFV.id]
+
+  tags = {
+    Name = "PACPJP-SbntGp-RAFV"
+  }
+}
+
+
+#PROVISION RDS
+resource "aws_db_instance" "PACPJP-RDS-RAFV" {
+  allocated_storage      = 10
+  engine                 = "mysql"
+  engine_version         = "5.7"
+  instance_class         = "db.t3.micro"
+  db_name                = "rdsrafv"
+  username               = "admin"
+  password               = "admin123"
+  parameter_group_name   = "default.mysql5.7"
+  skip_final_snapshot    = true
+  multi_az               = true
+  db_subnet_group_name   = aws_db_subnet_group.PACPJP-SbntGp-RAFV.name
+  vpc_security_group_ids = [aws_security_group.PACPJP-BE_SGp-RAFV.id]
+  identifier             = "rdsrafv"
+
+  tags = {
+    Name = "PACPJP-SbntGp-RAFV"
+  }
+}
+
+
+#SECOND STAGE - HIGH AVAILABILITY
+#The rest of the script should be applied after Application deployment
+
+#Add an Application Load Balancer
+resource "aws_lb" "PACPJP-AppLB-RAFV" {
+  name                       = "PACPJP-AppLB-RAFV"
+  internal                   = false
+  load_balancer_type         = "application"
+  security_groups            = [aws_security_group.PACPJP-FE_SGp-RAFV.id]
+  subnets                    = [aws_subnet.PACPJP-PubSbnt1-RAFV.id, aws_subnet.PACPJP-PubSbnt2-RAFV.id]
+  enable_deletion_protection = true
+
+  # access_logs {
+  #   bucket  = aws_s3_bucket.lb_logs.bucket
+  #   prefix  = "test-lb"
+  #   enabled = true
+  # }
+  tags = {
+    Environment = "RAFVprod"
+  }
+}
+
+
+#Create a Target Group for Load Balancer
+resource "aws_lb_target_group" "PACPJP-LBTgtGp-RAFV" {
+  name        = "PACPJP-LBTgtGp-RAFV"
+  #target_type = "alb" #run as is or delete code line
+  port        = 8080
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.PACPJP-VPC-RAFV.id
+  health_check {
+    healthy_threshold   = 3
+    unhealthy_threshold = 3
+    #timeout             = 60
+    interval            = 30
+    path                = "/"
+  }
+}
+
+
+#Add a load balancer Listener
+resource "aws_lb_listener" "PACPJP-LBLstnr-RAFV" {
+  load_balancer_arn = aws_lb.PACPJP-AppLB-RAFV.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.PACPJP-LBTgtGp-RAFV.arn
+  }
+}
+
+
+#Create Target group attachment
+resource "aws_lb_target_group_attachment" "PACPJP-LBTgtGpAtt-RAFV" {
+  target_group_arn = aws_lb_target_group.PACPJP-LBTgtGp-RAFV.arn
+  target_id        = aws_instance.PACPJP-dockerhost-RAFV.id
+  port             = 8080
+}
+
+
+#Create Docker_Host AMI Image
+resource "aws_ami_from_instance" "PACPJP-dockerhost-AMI-RAFV" {
+  name                    = "PACPJP-dockerhost-AMI-RAFV"
+  source_instance_id      = data.aws_instance.PACPJP-dockerhost-RAFV.id
+  snapshot_without_reboot = true
+
+  depends_on = [
+    aws_instance.PACPJP-dockerhost-RAFV,
+  ]
+  tags = {
+    Name = "PACPJP-dockerhost-AMI-RAFV"
+  }
+}
+
+
+#Provision Docker-launch-configuration
+resource "aws_launch_configuration" "PACPJP-dockerhost-LchCfg-RAFV" {
+  name_prefix                 = "PACPJP-dockerhost-LchCfg-RAFV"
+  image_id                    = aws_ami_from_instance.PACPJP-dockerhost-AMI-RAFV.id
+  instance_type               = var.instance_type
+  key_name                    = aws_key_pair.PetAdoption1_key.key_name
+  associate_public_ip_address = true
+  security_groups             = [aws_security_group.PACPJP-FE_SGp-RAFV.id]
+
+  user_data = <<-EOF
+#!/bin/bash
+sudo systemctl start docker
+sudo systemctl enable docker
+sudo docker start pet-adoption-container
+sudo hostnamectl set-hostname DockerASG
+EOF
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+
+#Creating Autoscaling Group
+resource "aws_autoscaling_group" "PACPJP-dockerhost-ASG-RAFV" {
+  name                      = "PACPJP-dockerhost-ASG-RAFV"
+  max_size                  = 4
+  min_size                  = 2
+  health_check_grace_period = 300
+  health_check_type         = "EC2"
+  desired_capacity          = 3
+  force_delete         = true
+  launch_configuration = aws_launch_configuration.PACPJP-dockerhost-LchCfg-RAFV.name
+  vpc_zone_identifier  = [aws_subnet.PACPJP-PubSbnt1-RAFV.id, aws_subnet.PACPJP-PubSbnt2-RAFV.id]
+  target_group_arns    = ["${aws_lb_target_group.PACPJP-LBTgtGp-RAFV.arn}"]
+
+  tag {
+    key                 = "Name"
+    value               = "PACPJP-DockerASG-RAFV"
+    propagate_at_launch = true
+  }
+
+  # initial_lifecycle_hook {
+  #   name                 = "PACPJP-DockerASG-lifecycle"
+  #   default_result       = "CONTINUE"
+  #   heartbeat_timeout    = 2000
+  #   lifecycle_transition = "autoscaling:EC2_INSTANCE_LAUNCHING"
+  # }
+}
+
+
+#Creating Autoscaling Policy
+resource "aws_autoscaling_policy" "PACPJP-ASG-policy-RAFV" {
+  name                   = "PACPJP-ASG-policy-RAFV"
+  policy_type            = "TargetTrackingScaling"
+  #scaling_adjustment     = 3
+  adjustment_type        = "ChangeInCapacity"
+  # cooldown               = 300
+  autoscaling_group_name = aws_autoscaling_group.PACPJP-dockerhost-ASG-RAFV.name
+
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+
+    target_value = 60.0
+  }
+}
+
+
+#Create Route 53
+resource "aws_route53_zone" "PACPJP-Route53-RAFV" {
+  name = var.domain_name
+
+  tags = {
+    Environment = "RAFVprod"
+  }
+}
+resource "aws_route53_record" "PACPJP-Arecord-RAFV" {
+  zone_id = aws_route53_zone.PACPJP-Route53-RAFV.zone_id
+  name    = var.domain_name
+  type    = "A"
+  # ttl     = "30"
+  alias {
+    name                   = aws_lb.PACPJP-AppLB-RAFV.dns_name
+    zone_id                = aws_lb.PACPJP-AppLB-RAFV.zone_id
+    evaluate_target_health = false
+  }
 }
