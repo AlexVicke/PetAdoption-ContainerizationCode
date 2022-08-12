@@ -117,3 +117,7 @@ variable "path-to-publickey" {
   default     = "~/Keypairs/PetAdoptionEU1.pub"
   description = "this is path to the keypair in our local machine"
 }
+
+variable "domain_name" {
+  default = "alexdevs.link"
+}
